@@ -3,7 +3,7 @@ members = [
     "crates/wayland-protocols",
     "crates/launcher",
     "crates/renderer",
-    "crates/utils",
+    "crates/utils", "crates/core",
 ]
 resolver = "2"
 

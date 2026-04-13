@@ -296,3 +296,8 @@ impl Connection {
             .ok_or_else(|| io::Error::other("Error"))
     }
 }
+
+// SAFETY: `Connection` is used exclusively from one thread at a time.
+// `UnixStream` and `IoUring` are both safe to move between threads; the
+// io_uring ring's kernel-mapped memory is process-global and thread-agnostic.
+unsafe impl Send for Connection {}
