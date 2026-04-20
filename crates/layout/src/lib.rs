@@ -166,6 +166,10 @@ impl<T: Measure> Layout<T> {
         self.computed[&id]
     }
 
+    pub fn set_style(&mut self, id: NodeId, style: Style) {
+        self.taffy.set_style(id, style).unwrap();
+    }
+
     pub fn data(&self, id: NodeId) -> &T {
         self.taffy.get_node_context(id).unwrap()
     }

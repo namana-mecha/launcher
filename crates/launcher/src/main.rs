@@ -2,11 +2,11 @@
 use anyhow::Result;
 use launcher::{profile_function, profile_scope};
 use renderer::primitives::RenderablePrimitive as _;
-use renderer::{GpuImage, Image, Quad, Rect as RenderRect, Renderer, TextMetrics, TextSystem};
+use renderer::{Quad, Rect as RenderRect, Renderer, TextMetrics, TextSystem};
+use std::f32::consts::TAU;
 use std::time::{Duration, Instant};
 use utils::asset_manager::AssetManager;
 use utils::font::FontAsset;
-use utils::image::ImageAsset;
 use wayland_protocols::connection::Connection;
 use wayland_protocols::wl_callback::SyncCallback;
 use wayland_protocols::wl_display::Display;
@@ -18,9 +18,37 @@ use wayland_protocols::zwp_linux_dmabuf::DmaBuf;
 use wayland_protocols::*;
 
 use layout::{
-    AlignItems, Dimension, Display as FlexDisplay, Edges, FlexDirection, JustifyContent, Layout,
-    LengthPercentage, LengthPercentageAuto, Measure, Position, Rect as LayoutRect, Size, Style,
+    Dimension, Display as FlexDisplay, Edges, FlexDirection, Layout, LengthPercentage, Measure,
+    NodeId, Rect as LayoutRect, Size, Style,
 };
+
+const WIDTH: u32 = 1028;
+const HEIGHT: u32 = 1080;
+const HEADER_H: f32 = 70.0;
+const ROWS: usize = 3;
+const COLS: usize = 4; // last col in each row uses flex_grow
+const ROW_H: f32 = 330.0;
+const GAP: f32 = 10.0;
+// Cells per row that have an explicit animated width (the last one flex-grows)
+const ANIM_COLS: usize = COLS - 1;
+
+const CELL_COLORS: [[f32; 4]; 12] = [
+    [1.0, 0.2, 0.3, 1.0],
+    [1.0, 0.5, 0.1, 1.0],
+    [0.9, 0.8, 0.1, 1.0],
+    [0.2, 0.8, 0.3, 1.0],
+    [0.1, 0.7, 0.9, 1.0],
+    [0.2, 0.4, 1.0, 1.0],
+    [0.6, 0.2, 1.0, 1.0],
+    [1.0, 0.2, 0.8, 1.0],
+    [1.0, 0.4, 0.2, 1.0],
+    [0.2, 0.9, 0.6, 1.0],
+    [0.4, 0.6, 1.0, 1.0],
+    [1.0, 0.7, 0.3, 1.0],
+];
+
+// (flat cell index, label) — cell index = row * COLS + col
+const TEXT_CELLS: [(usize, &str); 3] = [(1, "Mecha"), (5, "Launcher"), (9, "Demo")];
 
 struct Widget {
     measured: Option<TextMetrics>,
@@ -55,6 +83,27 @@ fn to_rect(r: LayoutRect) -> RenderRect {
         y: r.y,
         w: r.w,
         h: r.h,
+    }
+}
+
+fn cell_style(w: f32) -> Style {
+    Style {
+        size: Size {
+            width: Dimension::length(w),
+            height: Dimension::length(ROW_H),
+        },
+        ..Default::default()
+    }
+}
+
+fn grow_style() -> Style {
+    Style {
+        flex_grow: 1.0,
+        size: Size {
+            width: Dimension::auto(),
+            height: Dimension::length(ROW_H),
+        },
+        ..Default::default()
     }
 }
 
@@ -152,42 +201,48 @@ fn main() -> Result<()> {
     surface.commit(&mut conn)?;
     conn.flush()?;
 
-    const WIDTH: u32 = 1028;
-    const HEIGHT: u32 = 1080;
-
     let mut renderer = Renderer::new(WIDTH, HEIGHT)?;
     renderer.register::<Quad>()?;
     renderer.register::<renderer::MonoSprite>()?;
-    renderer.register::<Image>()?;
 
     let mut assets = AssetManager::new();
     let font_handle = assets.load::<FontAsset, _>("assets/Inter-Regular.ttf")?;
-    let logo_handle = assets.load::<ImageAsset, _>("assets/logo.png")?;
 
     let mut text_sys = TextSystem::new(renderer.gl(), 1024)?;
     let font_id = text_sys.load_font(&assets.get(&font_handle).unwrap().data)?;
 
-    assets
-        .process_pending(&mut renderer.image_processor())
-        .into_iter()
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    // ── Pre-measure text ──────────────────────────────────────────────────────
 
-    let logo = logo_handle.get_processed::<GpuImage>(&assets).unwrap();
-    let logo_w = logo.width as f32;
-    let logo_h = logo.height as f32;
-    let logo_tex = logo.id();
+    let header_m = text_sys.measure_text("Kitchen Sink", font_id, 36.0);
+    let cell_text_ms: Vec<TextMetrics> = TEXT_CELLS
+        .iter()
+        .map(|(_, label)| text_sys.measure_text(label, font_id, 28.0))
+        .collect();
 
-    // ── Layout (computed once at startup) ─────────────────────────────────────
+    // ── Layout tree (structure fixed; cell widths updated every frame) ─────────
+    //
+    // Root (flex col)
+    //   Header (fixed height)
+    //   Row 0 (flex row, gap) → cell[0][0..2] + cell[0][3] (flex-grow)
+    //   Row 1 (flex row, gap) → cell[1][0..2] + cell[1][3] (flex-grow)
+    //   Row 2 (flex row, gap) → cell[2][0..2] + cell[2][3] (flex-grow)
 
-    let label_m = text_sys.measure_text("Welcome", font_id, 36.0);
-    let button_m = text_sys.measure_text("Get Started", font_id, 18.0);
+    let initial_w = 180.0_f32;
 
-    let (mut layout, (logo_id, label_id, button_id)) = Layout::new(
+    let (mut layout, (header_id, row_cell_ids)) = Layout::new(
         Style {
             display: FlexDisplay::Flex,
             flex_direction: FlexDirection::Column,
-            justify_content: Some(JustifyContent::Center),
-            align_items: Some(AlignItems::Center),
+            gap: Size {
+                width: LengthPercentage::length(GAP),
+                height: LengthPercentage::length(GAP),
+            },
+            padding: Edges {
+                top: LengthPercentage::length(0.0),
+                right: LengthPercentage::length(GAP),
+                bottom: LengthPercentage::length(GAP),
+                left: LengthPercentage::length(GAP),
+            },
             size: Size {
                 width: Dimension::percent(1.0),
                 height: Dimension::percent(1.0),
@@ -196,57 +251,45 @@ fn main() -> Result<()> {
         },
         no_measure(),
         |b| {
-            let logo = b.leaf(
+            let header = b.leaf(
                 Style {
-                    position: Position::Absolute,
-                    inset: Edges {
-                        top: LengthPercentageAuto::length(20.0),
-                        right: LengthPercentageAuto::length(20.0),
-                        bottom: LengthPercentageAuto::auto(),
-                        left: LengthPercentageAuto::auto(),
-                    },
                     size: Size {
-                        width: Dimension::length(logo_w),
-                        height: Dimension::length(logo_h),
+                        width: Dimension::percent(1.0),
+                        height: Dimension::length(HEADER_H),
                     },
                     ..Default::default()
                 },
-                no_measure(),
+                measured(header_m),
             );
 
-            let (_, (label, button)) = b.child(
-                Style {
-                    display: FlexDisplay::Flex,
-                    flex_direction: FlexDirection::Column,
-                    align_items: Some(AlignItems::Center),
-                    gap: Size {
-                        width: LengthPercentage::length(0.0),
-                        height: LengthPercentage::length(24.0),
-                    },
-                    ..Default::default()
-                },
-                no_measure(),
-                |b| {
-                    let label = b.leaf(Default::default(), measured(label_m));
+            let mut row_cell_ids = [[NodeId::new(0); COLS]; ROWS];
 
-                    let button = b.leaf(
-                        Style {
-                            padding: Edges {
-                                top: LengthPercentage::length(12.0),
-                                right: LengthPercentage::length(28.0),
-                                bottom: LengthPercentage::length(12.0),
-                                left: LengthPercentage::length(28.0),
-                            },
-                            ..Default::default()
+            for row in 0..ROWS {
+                let (_, ids) = b.child(
+                    Style {
+                        display: FlexDisplay::Flex,
+                        flex_direction: FlexDirection::Row,
+                        gap: Size {
+                            width: LengthPercentage::length(GAP),
+                            height: LengthPercentage::length(0.0),
                         },
-                        measured(button_m),
-                    );
+                        ..Default::default()
+                    },
+                    no_measure(),
+                    |b| {
+                        let mut ids = [NodeId::new(0); COLS];
+                        for col in 0..ANIM_COLS {
+                            ids[col] = b.leaf(cell_style(initial_w), no_measure());
+                        }
+                        // last column fills remaining row width
+                        ids[ANIM_COLS] = b.leaf(grow_style(), no_measure());
+                        ids
+                    },
+                );
+                row_cell_ids[row] = ids;
+            }
 
-                    (label, button)
-                },
-            );
-
-            (logo, label, button)
+            (header, row_cell_ids)
         },
     );
 
@@ -264,6 +307,7 @@ fn main() -> Result<()> {
 
     let mut frame_count = 0u64;
     let mut last_fps_report = Instant::now();
+    let start_time = Instant::now();
 
     loop {
         #[cfg(feature = "profile")]
@@ -320,60 +364,90 @@ fn main() -> Result<()> {
             {
                 profile_scope!("render");
 
-                scene.clear_primitives();
-                scene.background = (0.97, 0.97, 0.97); // light — logo and text are dark
+                let t = start_time.elapsed().as_secs_f32();
 
-                // ── Logo (top-right) ──────────────────────────────────────────
-                let lr = layout.rect(logo_id);
-                Image {
-                    bounds: to_rect(lr),
-                    texture: logo_tex,
+                // ── Update animated cell widths and recompute layout ───────────
+                for row in 0..ROWS {
+                    for col in 0..ANIM_COLS {
+                        let flat = row * COLS + col;
+                        let phase = flat as f32 * TAU / (ROWS * ANIM_COLS) as f32;
+                        let w = 80.0 + 180.0 * ((t * 0.8 + phase).sin() * 0.5 + 0.5);
+                        layout.set_style(row_cell_ids[row][col], cell_style(w));
+                    }
+                }
+                layout.compute(LayoutRect {
+                    x: 0.0,
+                    y: 0.0,
+                    w: WIDTH as f32,
+                    h: HEIGHT as f32,
+                });
+
+                scene.clear_primitives();
+                scene.background = (0.08, 0.08, 0.12);
+
+                // ── Header background + title ─────────────────────────────────
+                let hr = layout.rect(header_id);
+                Quad {
+                    bounds: to_rect(hr),
+                    color: [0.05, 0.05, 0.10, 1.0],
                     clip_rect: None,
                 }
                 .add_to_scene(&mut scene);
 
-                // ── Label ("Welcome") ─────────────────────────────────────────
-                // rect is exactly the text bounding box; origin is baseline-left
-                let tr = layout.rect(label_id);
-                let lm = layout.data(label_id).measured.as_ref().unwrap();
+                let hm = layout.data(header_id).measured.as_ref().unwrap();
                 text_sys.draw_text(
                     &mut scene,
                     renderer.gl(),
-                    "Welcome",
+                    "Kitchen Sink",
                     font_id,
                     36.0,
-                    [0.1, 0.1, 0.1, 1.0],
-                    [tr.x, tr.y + lm.ascent],
-                )?;
-
-                // ── Button ────────────────────────────────────────────────────
-                let br = layout.rect(button_id);
-                Quad {
-                    bounds: to_rect(br),
-                    color: [0.18, 0.46, 0.96, 1.0],
-                    clip_rect: None,
-                }
-                .add_to_scene(&mut scene);
-
-                // center button text within the button rect
-                let bm = layout.data(button_id).measured.as_ref().unwrap();
-                text_sys.draw_text(
-                    &mut scene,
-                    renderer.gl(),
-                    "Get Started",
-                    font_id,
-                    18.0,
                     [1.0, 1.0, 1.0, 1.0],
                     [
-                        br.x + (br.w - bm.width) / 2.0,
-                        br.y + (br.h - bm.height()) / 2.0 + bm.ascent,
+                        hr.x + (hr.w - hm.width) / 2.0,
+                        hr.y + (hr.h - hm.height()) / 2.0 + hm.ascent,
                     ],
                 )?;
+
+                // ── Grid cells ────────────────────────────────────────────────
+                for row in 0..ROWS {
+                    for col in 0..COLS {
+                        let flat = row * COLS + col;
+                        let cell_r = layout.rect(row_cell_ids[row][col]);
+                        Quad {
+                            bounds: to_rect(cell_r),
+                            color: CELL_COLORS[flat],
+                            clip_rect: None,
+                        }
+                        .add_to_scene(&mut scene);
+                    }
+                }
+
+                // ── Text in selected cells ────────────────────────────────────
+                for (idx, &(flat, label)) in TEXT_CELLS.iter().enumerate() {
+                    let row = flat / COLS;
+                    let col = flat % COLS;
+                    let cell_r = layout.rect(row_cell_ids[row][col]);
+                    let m = &cell_text_ms[idx];
+                    // only draw text if it fits within the cell
+                    if m.width <= cell_r.w && m.height() <= cell_r.h {
+                        text_sys.draw_text(
+                            &mut scene,
+                            renderer.gl(),
+                            label,
+                            font_id,
+                            28.0,
+                            [1.0, 1.0, 1.0, 1.0],
+                            [
+                                cell_r.x + (cell_r.w - m.width) / 2.0,
+                                cell_r.y + (cell_r.h - m.height()) / 2.0 + m.ascent,
+                            ],
+                        )?;
+                    }
+                }
 
                 renderer.begin_frame(&render_surface, scene.background);
                 renderer.render_primitive::<Quad>(&scene, &render_surface)?;
                 renderer.render_primitive::<renderer::MonoSprite>(&scene, &render_surface)?;
-                renderer.render_primitive::<Image>(&scene, &render_surface)?;
                 renderer.end_frame();
             }
 
